@@ -1,4 +1,5 @@
 #pragma once
+#include "lucmath.h"
 #include <vector>
 #include <thread>
 #include <functional>
