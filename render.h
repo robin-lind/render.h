@@ -29,34 +29,30 @@ template<typename TSize>
 struct work_block
 {
 	work_range<TSize> tile;
-	work_range<TSize>& domain;
+	work_range<TSize> domain;
 	work_block() = default;
-	work_block(work_range<TSize> _tile, work_range<TSize>& _domain) : tile(_tile), domain(_domain) {}
+	work_block(work_range<TSize> _tile, work_range<TSize> _domain) : tile(_tile), domain(_domain) {}
 };
 
-template<typename TSize>
-struct work_item
+template<typename TFloat>
+struct uv_transform
 {
-	TSize x, y;
-	const work_block<TSize>& block;
-	work_item() = default;
-	work_item(TSize _x, TSize _y, const work_block<TSize>& _block) : x(_x), y(_y), block(_block) {}
+	TFloat minx, maxx, miny, maxy;
+	uv_transform() = default;
 
-	template<typename TFloat>
-	luc::VectorTN<TFloat, 2> pixel_center_uv_to_domain_center_uv(TFloat u, TFloat v) const
+	template<typename TSize>
+	uv_transform(TSize x, TSize y, const work_range<TSize>& domain)
 	{
-		const auto su = luc::Map<TFloat>(x + TFloat(.5) + u, block.domain.minx, block.domain.maxx, 0, 1);
-		const auto sv = luc::Map<TFloat>(y + TFloat(.5) + v, block.domain.miny, block.domain.maxy, 0, 1);
-		return luc::VectorTN<TFloat, 2>(su - TFloat(.5), sv - TFloat(.5));
+		minx = luc::Map<TFloat>(x, domain.minx, domain.maxx, 0, 1) - TFloat(.5);
+		miny = luc::Map<TFloat>(y, domain.miny, domain.maxy, 0, 1) - TFloat(.5);
+		maxx = luc::Map<TFloat>(x + TFloat(1.), domain.minx, domain.maxx, 0, 1) - TFloat(.5);
+		maxy = luc::Map<TFloat>(y + TFloat(1.), domain.miny, domain.maxy, 0, 1) - TFloat(.5);
 	}
-	
-	template<typename TFloat>
-	luc::VectorTN<TFloat, 2> domain_center_uv_to_pixel_center_uv(TFloat u, TFloat v) const
+
+	luc::VectorTN<TFloat, 2> transform(TFloat u, TFloat v) const
 	{
-		const auto du = luc::Map<TFloat>(u + TFloat(.5), 0, 1, block.domain.minx, block.domain.maxx) - TFloat(.5);
-		const auto dv = luc::Map<TFloat>(v + TFloat(.5), 0, 1, block.domain.miny, block.domain.maxy) - TFloat(.5);
-		const auto su = du - TFloat(x);
-		const auto sv = dv - TFloat(y);
+		const auto su = luc::Map<TFloat>(u, -.5f, .5f, minx, maxx);
+		const auto sv = luc::Map<TFloat>(v, -.5f, .5f, miny, maxy);
 		return luc::VectorTN<TFloat, 2>(su, sv);
 	}
 };
@@ -130,8 +126,59 @@ std::queue<work_range<TSize>> range_queue_from_domain(std::vector<work_range<TSi
 	return range_queue;
 }
 
+//template<typename TSize>
+//void iterate_over_tile(const work_block<TSize>& block, std::function<void(TSize, TSize)> func)
+//{
+//	for (auto y = block.tile.miny; y < block.tile.maxy; y++)
+//	{
+//		for (auto x = block.tile.minx; x < block.tile.maxx; x++)
+//		{
+//			func(x, y);
+//		}
+//	}
+//}
+//
+//template<typename TSize, typename TColor>
+//void iterate_over_tile(const work_block<TSize>& block, std::function<TColor(TSize, TSize)> func)
+//{
+//	for (auto y = block.tile.miny; y < block.tile.maxy; y++)
+//	{
+//		for (auto x = block.tile.minx; x < block.tile.maxx; x++)
+//		{
+//			const auto color = func(x, y);
+//		}
+//	}
+//}
+//
+//template<typename TSize, typename TFloat>
+//void iterate_over_tile(const work_block<TSize>& block, std::function<void(TSize, TSize, uv_transform<TFloat>&)> func)
+//{
+//	for (auto y = block.tile.miny; y < block.tile.maxy; y++)
+//	{
+//		for (auto x = block.tile.minx; x < block.tile.maxx; x++)
+//		{
+//			uv_transform uvt(x, y, block.domain);
+//			func(x, y, uvt);
+//		}
+//	}
+//}
+
+template<typename TSize, typename TFloat=float>
+void iterate_over_tile(const work_block<TSize>& block, auto&& func, auto&& store)
+{
+	for (auto y = block.tile.miny; y < block.tile.maxy; y++)
+	{
+		for (auto x = block.tile.minx; x < block.tile.maxx; x++)
+		{
+			uv_transform<TFloat> uvt(x, y, block.domain);
+			const auto color = func(x, y, uvt);
+			store(x, y, color);
+		}
+	}
+}
+
 template<typename TSize = int>
-void parallel_for(work_domain<TSize>& domain, std::function<void(work_block<TSize>&)> func)
+void parallel_for(work_domain<TSize>& domain, auto&& func, auto&& store)
 {
 	auto range_queue = range_queue_from_domain(domain.ranges);
 	std::mutex work_stealing_mutex;
@@ -161,7 +208,7 @@ void parallel_for(work_domain<TSize>& domain, std::function<void(work_block<TSiz
 			if (range.has_value())
 			{
 				work_block<TSize> block(*range, domain.range);
-				func(block);
+				iterate_over_tile(block, func(block), store);
 			}
 			else
 			{
@@ -181,21 +228,25 @@ void parallel_for(work_domain<TSize>& domain, std::function<void(work_block<TSiz
 }
 
 template<typename TSize = int>
-void parallel_for(TSize width, TSize height, std::function<void(work_block<TSize>&)> func)
+void parallel_for(TSize width, TSize height, std::function<void(const work_block<TSize>&)> func)
 {
 	auto domain = generate_parallel_for_domain(width, height);
-	parallel_for(domain, func);
+	parallel_for<TSize>(domain, func);
 }
 
-template<typename TSize>
-void iterate_over_tile(const work_block<TSize>& block, std::function<void(work_item<TSize>&)> func)
-{
-	for (auto y = block.tile.miny; y < block.tile.maxy; y++)
-	{
-		for (auto x = block.tile.minx; x < block.tile.maxx; x++)
-		{
-			work_item<TSize> item(x, y, block);
-			func(item);
-		}
-	}
-}
+//template<typename TSize = int>
+//void parallel_for(work_domain<TSize>& domain, std::function<void(const work_item<TSize>&)> func)
+//{
+//	auto tile_func = [&](const work_block<TSize>& block)
+//	{
+//		iterate_over_tile(block, func);
+//	};
+//	parallel_for<TSize>(domain, tile_func);
+//}
+//
+//template<typename TSize = int>
+//void parallel_for(TSize width, TSize height, std::function<void(const work_item<TSize>&)> func)
+//{
+//	auto domain = generate_parallel_for_domain(width, height);
+//	parallel_for<TSize>(domain, func);
+//}
