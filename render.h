@@ -67,23 +67,26 @@ template<typename TSize>
 work_domain<TSize> generate_parallel_for_domain(TSize min_x, TSize max_x, TSize min_y, TSize max_y)
 {
 	work_domain<TSize> domain(min_x, max_x, min_y, max_y);
-	std::function<void(work_range<TSize>)> subdivide = [&](const work_range<TSize>& range)
+	std::queue<work_range<TSize>> queue;
+	queue.push(domain.range);
+	while (!queue.empty())
 	{
-		const TSize max_size = 64;
+		const auto range = queue.front();
+		queue.pop();
+		const TSize max_size = 32;
 		const auto w = range.maxx - range.minx;
 		const auto h = range.maxy - range.miny;
 		if (std::max(w, h) > max_size)
 		{
 			auto split = split_range(range);
-			subdivide(split.first);
-			subdivide(split.second);
+			queue.push(split.first);
+			queue.push(split.second);
 		}
 		else
 		{
 			domain.ranges.push_back(range);
 		}
-	};
-	subdivide(domain.range);
+	}
 	return domain;
 }
 
@@ -94,7 +97,7 @@ work_domain<TSize> generate_parallel_for_domain(TSize width, TSize height)
 }
 
 template<typename TSize>
-std::queue<work_range<TSize>> range_queue_from_domain(std::vector<work_range<TSize>>& domain_ranges)
+std::queue<work_range<TSize>> range_queue_from_domain(const std::vector<work_range<TSize>>& domain_ranges)
 {
 	std::queue<work_range<TSize>> range_queue;
 	for (const auto& range : domain_ranges)
@@ -105,7 +108,7 @@ std::queue<work_range<TSize>> range_queue_from_domain(std::vector<work_range<TSi
 }
 
 template<typename TSize, typename TFloat=float>
-void iterate_over_tile(const work_block<TSize>& block, auto&& func, auto&& store)
+void iterate_over_tile(const work_block<TSize>& block, auto&& item_func)
 {
 	for (auto y = block.tile.miny; y < block.tile.maxy; y++)
 	{
@@ -115,60 +118,60 @@ void iterate_over_tile(const work_block<TSize>& block, auto&& func, auto&& store
 			const auto miny = luc::Map<TFloat>(y, block.domain.miny, block.domain.maxy, 0, 1) - TFloat(.5);
 			const auto maxx = luc::Map<TFloat>(x + TFloat(1.), block.domain.minx, block.domain.maxx, 0, 1) - TFloat(.5);
 			const auto maxy = luc::Map<TFloat>(y + TFloat(1.), block.domain.miny, block.domain.maxy, 0, 1) - TFloat(.5);
-			auto transform = [&](TFloat u, TFloat v)
+			auto transform = [minx, miny, maxx, maxy](TFloat u, TFloat v)
 			{
 				const auto su = luc::Map<TFloat>(u, -.5f, .5f, minx, maxx);
 				const auto sv = luc::Map<TFloat>(v, -.5f, .5f, miny, maxy);
 				return luc::VectorTN<TFloat, 2>(su, sv);
 			};
-			const auto color = func(x, y, transform);
-			store(x, y, color);
+			item_func(x, y, transform);
 		}
 	}
 }
 
-template<typename TSize = int>
-void parallel_for(work_domain<TSize>& domain, auto&& tile_func, auto&& store_result)
+struct abort_token
+{
+	bool aborted = false;
+	abort_token() = default;
+	void abort() { aborted = true; }
+};
+
+template<typename TSize = int, bool parallel = true>
+void parallel_for(const work_domain<TSize>& domain, auto&& tile_func, abort_token& aborter)
 {
 	auto range_queue = range_queue_from_domain(domain.ranges);
 	std::mutex work_stealing_mutex;
-	const auto number_of_threads = std::thread::hardware_concurrency();
-	auto take_range = [&]()
-	{
-		std::scoped_lock stealing_work(work_stealing_mutex);
-		if (range_queue.size() == 0)
-			return std::optional<work_range<TSize>>();
-		const auto range = range_queue.front();
-		range_queue.pop();
-		const auto w = range.maxx - range.minx;
-		const auto h = range.maxy - range.miny;
-		if (range_queue.size() < number_of_threads && std::min(w,h) > 4)
-		{
-			const auto& split = split_range(range);
-			range_queue.push(split.second);
-			return std::make_optional(split.first);
-		}
-		return std::make_optional(range);
-	};
+	const auto hardware_concurrency = std::thread::hardware_concurrency();
+	//const auto number_of_threads = hardware_concurrency * 3 / 2;
+	//const auto number_of_threads = hardware_concurrency * 32 / 22;
+	const auto number_of_threads = hardware_concurrency * 4 / 3;
+	//const auto number_of_threads = hardware_concurrency;
+	const auto thread_count = parallel ? std::thread::hardware_concurrency() : 1;
 	auto worker = [&]()
 	{
-		while (true)
+		work_block<TSize> block(domain.range, domain.range);
+		while (!aborter.aborted)
 		{
-			auto range = take_range();
-			if (range.has_value())
 			{
-				work_block<TSize> block(*range, domain.range);
-				auto item_func = tile_func(block);
-				iterate_over_tile(block, item_func, store_result);
+				std::scoped_lock stealing_work(work_stealing_mutex);
+				if (range_queue.size() == 0)
+					break;
+				block.tile = range_queue.front();
+				range_queue.pop();
+				const auto w = block.tile.maxx - block.tile.minx;
+				const auto h = block.tile.maxy - block.tile.miny;
+				if (range_queue.size() < thread_count && std::min(w, h) > 4)
+				{
+					const auto& split = split_range(block.tile);
+					range_queue.push(split.second);
+					block.tile = split.first;
+				}
 			}
-			else
-			{
-				break;
-			}
+			tile_func(block);
 		}
 	};
 	std::vector<std::thread> threads;
-	for (size_t i = 0; i < number_of_threads; i++)
+	for (size_t i = 0; i < thread_count; i++)
 	{
 		threads.emplace_back(worker);
 	}
